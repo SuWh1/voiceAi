@@ -1,76 +1,79 @@
 import os
-import tempfile
-from pathlib import Path
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from openai import OpenAI
 from fastapi import UploadFile
 
+# Load environment variables from .env file
 load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    raise RuntimeError("OPENAI_API_KEY not set in environment")
 
-client = OpenAI(api_key=api_key)
+# Initialize the async OpenAI client
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-SYSTEM_PROMPT = "You are a helpful assistant. Respond concisely in under 100 words."
+# A simple in-memory cache for transcriptions to avoid re-processing
+transcription_cache = {}
 
 async def transcribe_audio(file: UploadFile):
     """
-    Transcribe uploaded audio via Whisper.
-    Writes to a temp file with correct suffix so Whisper recognizes format.
-    Returns: {"transcript": str}
+    Transcribes the given audio file using OpenAI's Whisper model.
     """
-    # Read all bytes
-    contents = await file.read()
-    # Determine suffix from original filename, default to .webm if missing
-    suffix = Path(file.filename).suffix or ".webm"
-    # Write to a NamedTemporaryFile so OpenAI SDK can inspect extension
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(contents)
-        tmp.flush()
-        tmp_path = tmp.name
+    file_content = await file.read()
+    file_key = hash(file_content)
 
+    # Check cache first
+    if file_key in transcription_cache:
+        return {"text": transcription_cache[file_key]}
+
+    # Create a file-like object for the OpenAI API
+    # The filename is important for the API to determine the file type
+    file_for_openai = (file.filename, file_content, file.content_type)
+    
     try:
-        with open(tmp_path, "rb") as f:
-            resp = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f
-            )
+        transcription = await client.audio.transcriptions.create(
+            model="whisper-1",
+            file=file_for_openai,
+        )
+        transcribed_text = transcription.text
+        # Cache the result
+        transcription_cache[file_key] = transcribed_text
+        return {"text": transcribed_text}
     except Exception as e:
-        # Clean up temp file, then propagate error
-        os.remove(tmp_path)
-        raise RuntimeError(f"Whisper transcription failed: {e}")
-    # Cleanup
-    os.remove(tmp_path)
-    return {"transcript": resp.text}
+        # It's good practice to log the error
+        print(f"Error during transcription: {e}")
+        raise e
 
-async def chat_with_gpt(user_input: str, history: list[dict], voice: str = "nova"):
+
+async def chat_and_get_speech(user_text: str, history: list, voice: str = "nova"):
     """
-    Call GPT with history + user_input, then TTS the reply.
-    Returns: (audio_bytes: bytes, reply_text: str)
+    1. Gets a text response from GPT based on us    er text and history.
+    2. Converts the text response to speech using OpenAI's TTS model.
+    3. Returns both the AI's text reply and the audio bytes.
     """
-    if not isinstance(history, list):
-        history = []
-    trimmed = history[-4:] if len(history) > 4 else history
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + trimmed + [
-        {"role": "user", "content": user_input[:500]}
+    # 1. Get Text Response from GPT
+    messages = [
+        {"role": "system", "content": "You are a helpful voice assistant. Keep your answers concise and conversational."},
+        *history,
+        {"role": "user", "content": user_text}
     ]
 
-    # ChatCompletion
-    chat_resp = client.chat.completions.create(
-        model="gpt-3.5-turbo-0125",
-        messages=messages,
-        temperature=0.7,
-        max_tokens=150
-    )
-    reply_text = chat_resp.choices[0].message.content.strip()
+    try:
+        chat_completion = await client.chat.completions.create(
+            model="gpt-3.5-turbo-0125",  # or "gpt-3.5-turbo"
+            messages=messages
+        )
+        reply_text = chat_completion.choices[0].message.content
 
-    # TTS
-    speech_resp = client.audio.speech.create(
-        model="tts-1",
-        voice=voice,
-        input=reply_text[:400],
-        response_format="mp3"
-    )
-    audio_bytes = speech_resp.read()
-    return audio_bytes, reply_text
+        # 2. Convert Text to Speech
+        speech_response = await client.audio.speech.create(
+            model="tts-1",
+            voice=voice, # 'alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'
+            input=reply_text
+        )
+        
+        # Read the audio data into bytes
+        audio_bytes = await speech_response.aread()
+
+        return audio_bytes, reply_text
+
+    except Exception as e:
+        print(f"Error during chat/speech generation: {e}")
+        raise e

@@ -1,48 +1,71 @@
-import io
+import base64
+import traceback
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from openai_api import transcribe_audio, chat_with_gpt
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# Your helper functions are imported correctly
+from openai_api import transcribe_audio, chat_and_get_speech
 
 app = FastAPI()
 
+# Make sure your React app's origin is allowed. 
+# Using "http://localhost:3000" is more secure than "*".
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # The URL of your React app
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.post("/transcribe/")
+# Pydantic model for type-checking the incoming request body from the frontend
+class ChatPayload(BaseModel):
+    text: str
+    history: list = []
+    voice: str = "nova"
+
+@app.get("/")
+def read_root():
+    return {"status": "API is running"}
+
+@app.post("/transcribe")
 async def endpoint_transcribe(file: UploadFile = File(...)):
+    """
+    Endpoint to transcribe audio. It receives an audio file and returns the text.
+    """
     try:
         return await transcribe_audio(file)
     except Exception as e:
-        # Return the error message for debugging
-        return JSONResponse({"error": str(e)}, status_code=400)
+        print(f"Error in /transcribe: {e}")
+        traceback.print_exc()
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
-@app.post("/chat-text/")
-async def endpoint_chat_text(payload: dict):
-    user_text = payload.get("text", "").strip()
-    if not user_text:
-        return JSONResponse({"error": "No text provided"}, status_code=400)
-    history = payload.get("history", [])
-    voice = payload.get("voice", "nova")
+# --- THIS IS THE CORRECTED AND CONSOLIDATED ENDPOINT ---
+@app.post("/chat") # Defined at "/chat" to match the frontend call
+async def endpoint_chat(payload: ChatPayload):
+    """
+    This single endpoint receives text, gets the AI's text and voice response,
+    and sends them back together.
+    """
     try:
-        _, reply_text = await chat_with_gpt(user_text, history, voice)
-    except Exception as e:
-        return JSONResponse({"error": f"OpenAI error: {e}"}, status_code=500)
-    return {"reply": reply_text}
+        # This function correctly returns both audio bytes and the reply text
+        audio_bytes, reply_text = await chat_and_get_speech(
+            user_text=payload.text,
+            history=payload.history,
+            voice=payload.voice
+        )
+        
+        # Encode the binary audio data to a Base64 string so it can be sent in JSON
+        audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
 
-@app.post("/chat-voice/")
-async def endpoint_chat_voice(payload: dict):
-    user_text = payload.get("text", "").strip()
-    if not user_text:
-        return JSONResponse({"error": "No text provided"}, status_code=400)
-    history = payload.get("history", [])
-    voice = payload.get("voice", "nova")
-    try:
-        audio_bytes, _ = await chat_with_gpt(user_text, history, voice)
+        # Return the JSON object that the frontend is expecting
+        return {
+            "reply_text": reply_text,
+            "reply_audio": audio_base64
+        }
     except Exception as e:
-        return JSONResponse({"error": f"OpenAI error: {e}"}, status_code=500)
-    return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
+        print(f"Error in /chat: {e}")
+        traceback.print_exc()
+        return JSONResponse(content={"error": f"Internal Server Error: {e}"}, status_code=500)
